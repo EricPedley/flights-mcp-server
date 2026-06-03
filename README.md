@@ -1,6 +1,6 @@
 # Google Flights search
 
-Search Google Flights from the command line or an MCP client. Find cheapest, "best", or time-filtered flights for any route — one-way or round-trip.
+Search Google Flights from the command line or an MCP client. Find cheapest, "best", or time-filtered flights for any route — one-way or round-trip. I prefer the CLI but it was zero-cost to ask Claude to keep the MCP around in case I want to use it later for whatever reason.
 
 ## What it does
 
