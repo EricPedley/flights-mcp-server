@@ -1,17 +1,18 @@
+"""Flight search CLI + shared helpers.
+
+This module holds the search/format helpers and the command-line interface.
+The MCP server lives in flights_mcp.py and imports the `_general`, `_cheapest`,
+`_best`, and `_time_filtered` helpers from here.
+"""
+
 import argparse
-import json
 import sys
 from dataclasses import asdict
 from datetime import datetime
-from typing import Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
 
 from fast_flights import FlightData, Passengers, Result, get_flights
-
-
-mcp = FastMCP("flights")
 
 
 # ---------- Helpers ----------
@@ -206,95 +207,82 @@ def _time_filtered(state, target_time_str, origin, destination, departure_date,
     return [f"time-filtered {origin}->{destination} {departure_date} dep{op}{target_time_str}:"] + info
 
 
-# ---------- MCP tools ----------
-
-@mcp.tool()
-async def get_general_flights_info(origin: str, destination: str, departure_date: str,
-                                   trip_type: str = "one-way", seat: str = "economy",
-                                   adults: int = 1, children: int = 0,
-                                   infants_in_seat: int = 0, infants_on_lap: int = 0,
-                                   n_flights: int = 40,
-                                   return_date: Optional[str] = None) -> list[str]:
-    """Get general flight info. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date (YYYY-MM-DD)."""
-    return _general(origin, destination, departure_date, trip_type, seat,
-                    adults, children, infants_in_seat, infants_on_lap, n_flights, return_date)
-
-
-@mcp.tool()
-async def get_cheapest_flights(origin: str, destination: str, departure_date: str,
-                               trip_type: str = "one-way", seat: str = "economy",
-                               adults: int = 1, children: int = 0,
-                               infants_in_seat: int = 0, infants_on_lap: int = 0,
-                               return_date: Optional[str] = None) -> list[str]:
-    """Get cheapest flights. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date."""
-    return _cheapest(origin, destination, departure_date, trip_type, seat,
-                     adults, children, infants_in_seat, infants_on_lap, return_date)
-
-
-@mcp.tool()
-async def get_best_flights(origin: str, destination: str, departure_date: str,
-                           trip_type: str = "one-way", seat: str = "economy",
-                           adults: int = 1, children: int = 0,
-                           infants_in_seat: int = 0, infants_on_lap: int = 0,
-                           return_date: Optional[str] = None) -> list[str]:
-    """Get best flights. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date."""
-    return _best(origin, destination, departure_date, trip_type, seat,
-                 adults, children, infants_in_seat, infants_on_lap, return_date)
-
-
-@mcp.tool()
-async def get_time_filtered_flights(state: str, target_time_str: str, origin: str, destination: str,
-                                    departure_date: str,
-                                    trip_type: str = "one-way", seat: str = "economy",
-                                    adults: int = 1, children: int = 0,
-                                    infants_in_seat: int = 0, infants_on_lap: int = 0,
-                                    return_date: Optional[str] = None) -> list[str]:
-    """Filter outbound flights by departure time. For round-trip bundle pricing, pass return_date."""
-    return _time_filtered(state, target_time_str, origin, destination, departure_date,
-                          trip_type, seat, adults, children, infants_in_seat, infants_on_lap, return_date)
-
-
 # ---------- CLI ----------
 
 def _add_common(p):
-    p.add_argument("origin")
-    p.add_argument("destination")
-    p.add_argument("departure_date", help="YYYY-MM-DD")
-    p.add_argument("--trip-type", default="one-way", choices=["one-way", "round-trip"])
-    p.add_argument("--return-date", default=None, help="YYYY-MM-DD (required for round-trip)")
-    p.add_argument("--seat", default="economy", choices=["economy", "premium-economy", "business", "first"])
+    p.add_argument("origin", help="3-letter IATA origin code, e.g. BOS")
+    p.add_argument("destination", help="3-letter IATA destination code, e.g. ARN")
+    p.add_argument("departure_date", help="Outbound date, YYYY-MM-DD")
+    p.add_argument("--trip-type", default="one-way", choices=["one-way", "round-trip"],
+                   help="one-way (default) or round-trip. round-trip needs --return-date.")
+    p.add_argument("--return-date", default=None,
+                   help="Return date YYYY-MM-DD. Required for --trip-type round-trip.")
+    p.add_argument("--seat", default="economy",
+                   choices=["economy", "premium-economy", "business", "first"])
     p.add_argument("--adults", type=int, default=1)
     p.add_argument("--children", type=int, default=0)
     p.add_argument("--infants-in-seat", type=int, default=0)
     p.add_argument("--infants-on-lap", type=int, default=0)
 
 
+CLI_EPILOG = """\
+output format (one line per flight):
+  ORIG DEP_TIME DATE -> DEST ARR_TIME DATE | airline | Nstop | DURh DURm | $PRICE [*]
+  trailing * marks a flight Google flags as a "best" option.
+
+round-trip notes:
+  --trip-type round-trip returns OUTBOUND legs only, each carrying the full
+  round-trip BUNDLE price (cheaper than summing two one-ways). The return leg
+  times are not in this output -- run a separate one-way search on the return
+  date to see them.
+
+examples:
+  # cheapest one-way
+  flights.py cheapest BOS ARN 2026-07-06
+
+  # best round-trip bundle (outbound Jul 6, return Jul 9)
+  flights.py best BOS ARN 2026-07-06 --trip-type round-trip --return-date 2026-07-09
+
+  # outbound flights departing at/after 6:00 PM
+  flights.py time-filtered after "6:00 PM" BOS ARN 2026-07-06
+
+  # business-class, 2 adults
+  flights.py best BOS ARN 2026-07-06 --seat business --adults 2
+"""
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Flight search CLI / MCP server")
-    sub = parser.add_subparsers(dest="cmd")
+    parser = argparse.ArgumentParser(
+        prog="flights.py",
+        description="Search Google Flights from the command line. "
+                    "Outputs compact one-line-per-flight results meant for agents/scripts.",
+        epilog=CLI_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
 
-    p_mcp = sub.add_parser("mcp", help="Run as MCP server over stdio")
-
-    p_g = sub.add_parser("general", help="General flight info")
+    p_g = sub.add_parser("general", help="All flights, in Google's default order (most options)")
     _add_common(p_g)
-    p_g.add_argument("--n-flights", type=int, default=40)
+    p_g.add_argument("--n-flights", type=int, default=40, help="Max rows to return (default 40)")
 
-    p_c = sub.add_parser("cheapest", help="Cheapest flights")
+    p_c = sub.add_parser("cheapest", help="All flights sorted by price ascending")
     _add_common(p_c)
 
-    p_b = sub.add_parser("best", help="Best flights")
+    p_b = sub.add_parser("best", help='Only flights Google flags as "best" (price/duration balance)')
     _add_common(p_b)
 
-    p_t = sub.add_parser("time-filtered", help="Filter by outbound time")
-    p_t.add_argument("state", choices=["before", "after"])
-    p_t.add_argument("target_time_str", help="e.g. '7:00 PM'")
+    p_t = sub.add_parser("time-filtered",
+                         help="Flights filtered by OUTBOUND departure time")
+    p_t.add_argument("state", choices=["before", "after"],
+                     help="'before' = dep < target time; 'after' = dep >= target time")
+    p_t.add_argument("target_time_str", help='Target departure time, e.g. "7:00 PM"')
     _add_common(p_t)
 
     args = parser.parse_args()
 
-    if args.cmd is None or args.cmd == "mcp":
-        mcp.run(transport='stdio')
-        return
+    if args.cmd is None:
+        parser.print_help()
+        sys.exit(2)
 
     common = dict(
         origin=args.origin, destination=args.destination, departure_date=args.departure_date,
