@@ -1,516 +1,324 @@
-from typing import Any
+import argparse
+import json
+import sys
+from dataclasses import asdict
+from datetime import datetime
+from typing import Optional
+
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from fast_flights import FlightData, Passengers, Result, get_flights, search_airport
-from dataclasses import asdict
-
-from datetime import datetime
+from fast_flights import FlightData, Passengers, Result, get_flights
 
 
-# initialize the MCP server
 mcp = FastMCP("flights")
 
 
-# Helper Functions
+# ---------- Helpers ----------
 
 def format_flight_info(flight_data, origin_airport, destination_airport):
-    """
-    Formats flight information into a human-readable string.
-
-    Args:
-        flight_data: Dictionary containing flight information
-        origin_airport: Name of Origin airport city and IATA code (ex: "Seattle (SEA)")
-        destination_airport: Name of Destination airport city and IATA code (ex: "Tokyo (HND)")
-
-    Returns:
-        Formatted string describing the flight
-    """
-    
-    duration_parts = flight_data['duration'].split()
-    
-    if len(duration_parts) == 4:
-        duration_formatted = f"{duration_parts[0]} hours and {duration_parts[2]} minutes"
-    else:
-        duration_formatted = flight_data['duration']
-    
-    # Reformat departure and arrival dates
-    def expand_date(date_str):
-        # Map abbreviated month and day
-        month_map = {
-            'Jan': 'January', 'Feb': 'February', 'Mar': 'March', 
-            'Apr': 'April', 'May': 'May', 'Jun': 'June', 
-            'Jul': 'July', 'Aug': 'August', 'Sep': 'September', 
-            'Oct': 'October', 'Nov': 'November', 'Dec': 'December'
-        }
-        day_map = {'Mon': 'Monday', 'Tue': 'Tuesday', 'Wed': 'Wednesday', 
-                   'Thu': 'Thursday', 'Fri': 'Friday', 'Sat': 'Saturday', 
-                   'Sun': 'Sunday'}
-        
+    # Compact one-line format for agent consumption (no prose).
+    # e.g. "BOS 5:10 PM Jul 5 -> ARN 11:50 AM Jul 6 | Air France | 1stop | 12h40m | $480 *"
+    def short_dt(date_str):
+        # "5:10 PM on Sun, Jul 5" -> "5:10 PM Jul 5"
         parts = date_str.split()
-        time = f"{parts[0]} {parts[1]}"  # "9:40 AM"
-        
-        # Handle the day abbreviation (removing the comma)
-        day_abbr = parts[3].rstrip(',')  # "Sat" (removing comma from "Sat,")
-        month_abbr = parts[4]  # "Apr"
-        day = parts[5]  # "5"
-        
-        full_day = day_map.get(day_abbr, day_abbr)
-        full_month = month_map.get(month_abbr, month_abbr)
-        
-        # Add ordinal suffix to the day
-        day_with_suffix = day + ('th' if not day.endswith(('1', '2', '3')) or day.endswith(('11', '12', '13')) else 
-                                 ('st' if day.endswith('1') else 
-                                  ('nd' if day.endswith('2') else 
-                                   ('rd' if day.endswith('3') else 'th'))))
-        
-        return f"{time} on {full_day}, {full_month} {day_with_suffix}"
-    
-    # Determine best flight qualifier
-    best_flight_qualifier = "considered one of the best options by Google Flights" if flight_data['is_best'] else "an available option"
-    
-    # Handle potential None or empty values
+        return f"{parts[0]} {parts[1]} {parts[4]} {parts[5]}"
+
+    dp = flight_data['duration'].split()
+    dur = f"{dp[0]}h{dp[2]}m" if len(dp) == 4 else flight_data['duration']
+
     stops = flight_data["stops"]
-    stops_text = f"{stops} stop{'s' if stops != 1 else ''}" if stops > 0 else "non-stop"
-    
-    formatted_string = (
-        f"This flight departs at {expand_date(flight_data['departure'])} from {origin_airport}, local time, "
-        f"and arrives at {expand_date(flight_data['arrival'])} in {destination_airport}, local time. "
-        f"The flight is operated by {flight_data['name']} and has a duration of {duration_formatted} "
-        f"with {stops_text} in between. "
-        f"And it's price is {flight_data['price']} and is {best_flight_qualifier}!"
+    stops_text = "nonstop" if stops == 0 else f"{stops}stop"
+    star = " *" if flight_data['is_best'] else ""
+
+    return (
+        f"{origin_airport} {short_dt(flight_data['departure'])} -> "
+        f"{destination_airport} {short_dt(flight_data['arrival'])} | "
+        f"{flight_data['name']} | {stops_text} | {dur} | {flight_data['price']}{star}"
     )
-    
-    return formatted_string
 
 
+def _lines(flights, origin, destination):
+    """Format flights to compact lines, dropping exact duplicates."""
+    seen, out = set(), []
+    for f in flights:
+        line = format_flight_info(f, origin, destination)
+        if line not in seen:
+            seen.add(line)
+            out.append(line)
+    return out
 
 
-
-# Main Functions
-
-@mcp.tool()
-async def get_general_flights_info(origin: str, destination: str, departure_date: str,
-                      trip_type: str = "one-way", seat: str = "economy",
-                      adults: int = 1, children: int = 0, infants_in_seat: int = 0, infants_on_lap: int = 0,
-                      n_flights: int = 40) -> list[str]:
-    """ Get general/comprehensive flight information for N flights for a given origin, destination, and departure date. If the user wants to do a round-trip,
-    you will need to make two one-way trip calls.
-
-    Args:
-        origin (str): The origin airport IATA code (ex: "ATL", "SCL", "JFK").
-        destination (str): The destination airport IATA code (ex: "DTW", "ICN", "LIR").
-        departure_date (str): The departure date in YYYY-MM-DD format.
-
-        trip_type (str, optional): The type of trip ("one-way" or "round-trip" only). Defaults to "one-way".
-        seat (str, optional): The type of seat ("economy", "premium-economy", "business", or "first" only). Defaults to "economy".
-        adults (int, optional): The number of adults. Defaults to 1.
-        children (int, optional): The number of children. Defaults to 0.
-        infants_in_seat (int, optional): The number of infants in a seat. Defaults to 0.
-        infants_lap (int, optional): The number of infants on a lap. Defaults to 0.
-
-        n_flights (int, optional): The number of flights to return. Defaults to 25.
-
-    Returns:
-        list[str]: A list of flight information strings.
-    """
-
-    if (len(origin) != 3 or len(destination) != 3):
+def _validate(origin, destination, departure_date, trip_type, seat, return_date=None):
+    if len(origin) != 3 or len(destination) != 3:
         return "Origin and destination must be 3 characters."
-    
-    if (len(departure_date) != 10 or departure_date[4] != '-' or departure_date[7] != '-'):
+    if len(departure_date) != 10 or departure_date[4] != '-' or departure_date[7] != '-':
         return "Departure date must be in YYYY-MM-DD format."
-    
-    if (trip_type != "one-way" and trip_type != "round-trip"):
+    if trip_type not in ("one-way", "round-trip"):
         return "Trip type must be either 'one-way' or 'round-trip'."
-    
-    if (seat != "economy" and seat != "premium-economy" and seat != "business" and seat != "first"):
+    if seat not in ("economy", "premium-economy", "business", "first"):
         return "Seat type must be either 'economy', 'premium-economy', 'business', or 'first'."
-    
+    # Round-trip returns outbound legs, each carrying the full round-trip bundle price.
+    if trip_type == "round-trip" and not return_date:
+        return "round-trip requires return_date (YYYY-MM-DD)."
+    return None
+
+
+def _search(origin, destination, departure_date, trip_type, seat,
+            adults, children, infants_in_seat, infants_on_lap,
+            return_date=None) -> dict | str:
+    err = _validate(origin, destination, departure_date, trip_type, seat, return_date)
+    if err:
+        return err
+
+    flight_data_input = [FlightData(date=departure_date, from_airport=origin, to_airport=destination)]
+    if trip_type == "round-trip":
+        flight_data_input.append(FlightData(date=return_date, from_airport=destination, to_airport=origin))
+
+    passengers_input = Passengers(
+        adults=adults, children=children,
+        infants_in_seat=infants_in_seat, infants_on_lap=infants_on_lap,
+    )
 
     try:
-        
-        # Make API call to Google Flights via fast-flights
-
-        flight_data_input = [FlightData(date=departure_date, from_airport=origin, to_airport=destination)]
-        
-        passengers_input = Passengers(adults=adults, children=children, infants_in_seat=infants_in_seat, infants_on_lap=infants_on_lap)
-
         result: Result = get_flights(
             flight_data=flight_data_input,
             trip=trip_type,
             seat=seat,
             passengers=passengers_input,
-            fetch_mode="fallback"
+            fetch_mode="local",
         )
-        
-        result = asdict(result)
-        
-        if not result or "flights" not in result:
-            return ["No flight data available for the specified route and dates."]
-
-        current_price = result["current_price"]
-        all_flights = result["flights"]
-
-        if not all_flights:
-            return ["No flights found for the specified route and dates."]
-
-        top_n_flights = all_flights[0: min(n_flights, len(all_flights))]
-
-        flight_info = []
-
-        origin_airport = origin
-        destination_airport = destination
-
-        for flight in top_n_flights:
-            flight_info.append(format_flight_info(flight, origin_airport, destination_airport))
-
-        output = [f"The current overall flight prices for this route and time are: {str(current_price)}."] + flight_info
-
-
-        return output
-
-
+        return asdict(result)
     except httpx.RequestError:
-        return ["Unable to connect to the flight search service. Please try again later."]
-    
+        return "Unable to connect to the flight search service. Please try again later."
     except ValueError as e:
-        return [f"Invalid data received: {str(e)}"]
-    
+        return f"Invalid data received: {str(e)}"
     except Exception as e:
-        return [f"An unexpected error occurred while searching for flights: {str(e)}"]
+        return f"An unexpected error occurred while searching for flights: {str(e)}"
 
+
+def _general(origin, destination, departure_date, trip_type, seat,
+             adults, children, infants_in_seat, infants_on_lap,
+             n_flights, return_date=None) -> list[str]:
+    result = _search(origin, destination, departure_date, trip_type, seat,
+                     adults, children, infants_in_seat, infants_on_lap, return_date)
+    if isinstance(result, str):
+        return [result]
+    if not result or "flights" not in result:
+        return ["No flight data available for the specified route and dates."]
+
+    current_price = result["current_price"]
+    all_flights = result["flights"]
+    if not all_flights:
+        return ["No flights found for the specified route and dates."]
+
+    info = _lines(all_flights[: min(n_flights, len(all_flights))], origin, destination)
+    rt = f" RT->{return_date}" if trip_type == "round-trip" else ""
+    return [f"general {origin}->{destination} {departure_date}{rt} (overall:{current_price}):"] + info
+
+
+def _cheapest(origin, destination, departure_date, trip_type, seat,
+              adults, children, infants_in_seat, infants_on_lap,
+              return_date=None) -> list[str]:
+    result = _search(origin, destination, departure_date, trip_type, seat,
+                     adults, children, infants_in_seat, infants_on_lap, return_date)
+    if isinstance(result, str):
+        return [result]
+    if not result or "flights" not in result:
+        return ["No flight data available for the specified route and dates."]
+
+    all_flights = result["flights"]
+    if not all_flights:
+        return ["No flights found for the specified route and dates."]
+
+    def price_value(flight):
+        s = flight['price'].replace('$', '').replace(',', '')
+        try:
+            return float(s)
+        except ValueError:
+            return float('inf')
+
+    sorted_flights = sorted(all_flights, key=price_value)
+    info = _lines(sorted_flights[: min(30, len(sorted_flights))], origin, destination)
+    rt = f" RT->{return_date}" if trip_type == "round-trip" else ""
+    return [f"cheapest {origin}->{destination} {departure_date}{rt}:"] + info
+
+
+def _best(origin, destination, departure_date, trip_type, seat,
+          adults, children, infants_in_seat, infants_on_lap,
+          return_date=None) -> list[str]:
+    result = _search(origin, destination, departure_date, trip_type, seat,
+                     adults, children, infants_in_seat, infants_on_lap, return_date)
+    if isinstance(result, str):
+        return [result]
+    if not result or "flights" not in result:
+        return ["No flight data available for the specified route and dates."]
+
+    all_flights = result["flights"]
+    if not all_flights:
+        return ["No flights found for the specified route and dates."]
+
+    best_flights = [f for f in all_flights if f.get('is_best')]
+    if not best_flights:
+        return ["No best flights found for the specified route and dates."]
+
+    info = _lines(best_flights[: min(30, len(best_flights))], origin, destination)
+    rt = f" RT->{return_date}" if trip_type == "round-trip" else ""
+    return [f"best {origin}->{destination} {departure_date}{rt}:"] + info
+
+
+def _time_filtered(state, target_time_str, origin, destination, departure_date,
+                   trip_type, seat, adults, children, infants_in_seat, infants_on_lap,
+                   return_date=None) -> list[str]:
+    if state not in ("before", "after"):
+        return ["State must be either 'before' or 'after'."]
+    try:
+        target_time = datetime.strptime(target_time_str, '%I:%M %p').time()
+    except ValueError:
+        return ["Invalid time format. Please use HH:MM AM/PM format (e.g., '7:00 PM')."]
+
+    result = _search(origin, destination, departure_date, trip_type, seat,
+                     adults, children, infants_in_seat, infants_on_lap, return_date)
+    if isinstance(result, str):
+        return [result]
+    if not result or "flights" not in result:
+        return ["No flight data available for the specified route and dates."]
+
+    all_flights = result["flights"]
+    if not all_flights:
+        return ["No flights found for the specified route and dates."]
+
+    valid = []
+    for flight in all_flights:
+        parts = flight['departure'].split(" ")
+        time_str = parts[0] + " " + parts[1]
+        flight_time = datetime.strptime(time_str, '%I:%M %p').time()
+        if state == "before" and flight_time < target_time:
+            valid.append(flight)
+        elif state == "after" and flight_time >= target_time:
+            valid.append(flight)
+
+    if not valid:
+        return [f"No flights found {state} {target_time_str} for the specified route and dates."]
+
+    info = _lines(valid[: min(30, len(valid))], origin, destination)
+    op = "<" if state == "before" else ">="
+    return [f"time-filtered {origin}->{destination} {departure_date} dep{op}{target_time_str}:"] + info
+
+
+# ---------- MCP tools ----------
+
+@mcp.tool()
+async def get_general_flights_info(origin: str, destination: str, departure_date: str,
+                                   trip_type: str = "one-way", seat: str = "economy",
+                                   adults: int = 1, children: int = 0,
+                                   infants_in_seat: int = 0, infants_on_lap: int = 0,
+                                   n_flights: int = 40,
+                                   return_date: Optional[str] = None) -> list[str]:
+    """Get general flight info. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date (YYYY-MM-DD)."""
+    return _general(origin, destination, departure_date, trip_type, seat,
+                    adults, children, infants_in_seat, infants_on_lap, n_flights, return_date)
 
 
 @mcp.tool()
 async def get_cheapest_flights(origin: str, destination: str, departure_date: str,
-                      trip_type: str = "one-way", seat: str = "economy",
-                      adults: int = 1, children: int = 0, infants_in_seat: int = 0, infants_on_lap: int = 0) -> list[str]:
-   
-    """ Get the cheapest flight information for a given origin, destination, and departure date. If the user wants to do a round-trip,
-    you will need to make two one-way trip calls.
-
-    Args:
-        origin (str): The origin airport IATA code (ex: "ATL", "SCL", "JFK").
-        destination (str): The destination airport IATA code (ex: "DTW", "ICN", "LIR").
-        departure_date (str): The departure date in YYYY-MM-DD format.
-
-        trip_type (str, optional): The type of trip ("one-way" or "round-trip" only). Defaults to "one-way".
-        seat (str, optional): The type of seat ("economy", "premium-economy", "business", or "first" only). Defaults to "economy".
-        adults (int, optional): The number of adults. Defaults to 1.
-        children (int, optional): The number of children. Defaults to 0.
-        infants_in_seat (int, optional): The number of infants in a seat. Defaults to 0.
-        infants_lap (int, optional): The number of infants on a lap. Defaults to 0.
-
-    Returns:
-        list[str]: A list of flight information strings.
-    """
-
-    if (len(origin) != 3 or len(destination) != 3):
-        return "Origin and destination must be 3 characters."
-    
-    if (len(departure_date) != 10 or departure_date[4] != '-' or departure_date[7] != '-'):
-        return "Departure date must be in YYYY-MM-DD format."
-    
-    if (trip_type != "one-way" and trip_type != "round-trip"):
-        return "Trip type must be either 'one-way' or 'round-trip'."
-    
-    if (seat != "economy" and seat != "premium-economy" and seat != "business" and seat != "first"):
-        return "Seat type must be either 'economy', 'premium-economy', 'business', or 'first'."
-
-    try:
-        # Make API call to Google Flights via fast-flights
-
-        flight_data_input = [FlightData(date=departure_date, from_airport=origin, to_airport=destination)]
-        passengers_input = Passengers(adults=adults, children=children, infants_in_seat=infants_in_seat, infants_on_lap=infants_on_lap)
-
-        result: Result = get_flights(
-            flight_data=flight_data_input,
-            trip=trip_type,
-            seat=seat,
-            passengers=passengers_input,
-            fetch_mode="fallback"
-        )
-        
-        result = asdict(result)
-        
-        if not result or "flights" not in result:
-            return ["No flight data available for the specified route and dates."]
-
-        all_flights = result["flights"]
-
-        if not all_flights:
-            return ["No flights found for the specified route and dates."]
-
-        def get_price_value(flight):
-
-            price_str = flight['price']
-
-            # Remove $ and any commas from the price string
-            price_str = price_str.replace('$', '')
-            price_str = price_str.replace(',', '')
-
-            # Convert to decimal number
-            return float(price_str)
-
-        price_sorted_flights = sorted(all_flights, key=get_price_value)
-
-        top_n_flights = price_sorted_flights[0: min(30, len(price_sorted_flights))]
-
-        flight_info = []
-
-        origin_airport = origin
-        destination_airport = destination
-
-        for flight in top_n_flights:
-            flight_info.append(format_flight_info(flight, origin_airport, destination_airport))
-
-        output = ["Here are the cheapest flights for this route and time: "] + flight_info
-
-
-        return output
-
-
-
-    except httpx.RequestError:
-        return ["Unable to connect to the flight search service. Please try again later."]
-    
-    except ValueError as e:
-        return [f"Invalid data received: {str(e)}"]
-    
-    except Exception as e:
-        return [f"An unexpected error occurred while searching for flights: {str(e)}"]
+                               trip_type: str = "one-way", seat: str = "economy",
+                               adults: int = 1, children: int = 0,
+                               infants_in_seat: int = 0, infants_on_lap: int = 0,
+                               return_date: Optional[str] = None) -> list[str]:
+    """Get cheapest flights. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date."""
+    return _cheapest(origin, destination, departure_date, trip_type, seat,
+                     adults, children, infants_in_seat, infants_on_lap, return_date)
 
 
 @mcp.tool()
 async def get_best_flights(origin: str, destination: str, departure_date: str,
-                      trip_type: str = "one-way", seat: str = "economy",
-                      adults: int = 1, children: int = 0, infants_in_seat: int = 0, infants_on_lap: int = 0) -> list[str]:
-   
-    """ Get the best flights as determined by Google Flights for a given origin, destination, and departure date. If the user wants to do a round-trip,
-    you will need to make two one-way trip calls.
-
-    Args:
-        origin (str): The origin airport IATA code (ex: "ATL", "SCL", "JFK").
-        destination (str): The destination airport IATA code (ex: "DTW", "ICN", "LIR").
-        departure_date (str): The departure date in YYYY-MM-DD format.
-
-        trip_type (str, optional): The type of trip ("one-way" or "round-trip" only). Defaults to "one-way".
-        seat (str, optional): The type of seat ("economy", "premium-economy", "business", or "first" only). Defaults to "economy".
-        adults (int, optional): The number of adults. Defaults to 1.
-        children (int, optional): The number of children. Defaults to 0.
-        infants_in_seat (int, optional): The number of infants in a seat. Defaults to 0.
-        infants_lap (int, optional): The number of infants on a lap. Defaults to 0.
-
-    Returns:
-        list[str]: A list of flight information strings.
-    """
-
-    if (len(origin) != 3 or len(destination) != 3):
-        return "Origin and destination must be 3 characters."
-    
-    if (len(departure_date) != 10 or departure_date[4] != '-' or departure_date[7] != '-'):
-        return "Departure date must be in YYYY-MM-DD format."
-    
-    if (trip_type != "one-way" and trip_type != "round-trip"):
-        return "Trip type must be either 'one-way' or 'round-trip'."
-    
-    if (seat != "economy" and seat != "premium-economy" and seat != "business" and seat != "first"):
-        return "Seat type must be either 'economy', 'premium-economy', 'business', or 'first'."
-
-    try:
-        # Make API call to Google Flights via fast-flights
-
-        flight_data_input = [FlightData(date=departure_date, from_airport=origin, to_airport=destination)]
-
-        passengers_input = Passengers(adults=adults, children=children, infants_in_seat=infants_in_seat, infants_on_lap=infants_on_lap)
-
-        result: Result = get_flights(
-            flight_data=flight_data_input,
-            trip=trip_type,
-            seat=seat,
-            passengers=passengers_input,
-            fetch_mode="fallback"
-        )
-        
-        result = asdict(result)
-        
-        if not result or "flights" not in result:
-            return ["No flight data available for the specified route and dates."]
-
-        all_flights = result["flights"]
-
-        if not all_flights:
-            return ["No flights found for the specified route and dates."]
-
-        best_flights = []
-
-        for flight in all_flights:
-            if (flight['is_best']):
-                best_flights.append(flight)
-        
-        if not best_flights:
-            return ["No best flights found for the specified route and dates."]
-
-
-        top_n_flights = best_flights[0: min(30, len(best_flights))]
-
-        flight_info = []
-
-        origin_airport = origin
-        destination_airport = destination
-
-        for flight in top_n_flights:
-            flight_info.append(format_flight_info(flight, origin_airport, destination_airport))
-
-        output = ["Here are the best flights for this route and time: "] + flight_info
-
-
-        return output
-    
-
-
-
-    except httpx.RequestError:
-        return ["Unable to connect to the flight search service. Please try again later."]
-    
-    except ValueError as e:
-        return [f"Invalid data received: {str(e)}"]
-    
-    except Exception as e:
-        return [f"An unexpected error occurred while searching for flights: {str(e)}"]
-    
+                           trip_type: str = "one-way", seat: str = "economy",
+                           adults: int = 1, children: int = 0,
+                           infants_in_seat: int = 0, infants_on_lap: int = 0,
+                           return_date: Optional[str] = None) -> list[str]:
+    """Get best flights. For round-trip bundle pricing, set trip_type='round-trip' and pass return_date."""
+    return _best(origin, destination, departure_date, trip_type, seat,
+                 adults, children, infants_in_seat, infants_on_lap, return_date)
 
 
 @mcp.tool()
-async def get_time_filtered_flights(state: str, target_time_str: str, origin: str, destination: str, departure_date: str,
-                      trip_type: str = "one-way", seat: str = "economy",
-                      adults: int = 1, children: int = 0, infants_in_seat: int = 0, infants_on_lap: int = 0) -> list[str]:
-   
-    """ Get time-filtered flight information based on the user's preferences for before or after a certain time for a given origin, destination, and departure date. If the user wants to do a round-trip,
-    you will need to make two one-way trip calls.
-
-    Args:
-        state (str): The state of the flight ("before" or "after" only). For before, we do before the target time. For after, we do on or after the target time. 
-        target_time_str (str): The target time in HH:MM AM/PM format (ex: "7:00 PM").
-        origin (str): The origin airport IATA code (ex: "ATL", "SCL", "JFK").
-        destination (str): The destination airport IATA code (ex: "DTW", "ICN", "LIR").
-        departure_date (str): The departure date in YYYY-MM-DD format.
-
-        trip_type (str, optional): The type of trip ("one-way" or "round-trip" only). Defaults to "one-way".
-        seat (str, optional): The type of seat ("economy", "premium-economy", "business", or "first" only). Defaults to "economy".
-        adults (int, optional): The number of adults. Defaults to 1.
-        children (int, optional): The number of children. Defaults to 0.
-        infants_in_seat (int, optional): The number of infants in a seat. Defaults to 0.
-        infants_lap (int, optional): The number of infants on a lap. Defaults to 0.
-
-    Returns:
-        list[str]: A list of flight information strings.
-    """
-
-    if (len(origin) != 3 or len(destination) != 3):
-        return "Origin and destination must be 3 characters."
-    
-    if (len(departure_date) != 10 or departure_date[4] != '-' or departure_date[7] != '-'):
-        return "Departure date must be in YYYY-MM-DD format."
-    
-    if (trip_type != "one-way" and trip_type != "round-trip"):
-        return "Trip type must be either 'one-way' or 'round-trip'."
-    
-    if (seat != "economy" and seat != "premium-economy" and seat != "business" and seat != "first"):
-        return "Seat type must be either 'economy', 'premium-economy', 'business', or 'first'."
-    
-    if (state != "before" and state != "after"):
-        return "State must be either 'before' or 'after'."
-
-    try:
-        # Validate time format first
-
-        try:
-            target_time = datetime.strptime(target_time_str, '%I:%M %p').time()
-        except ValueError:
-            return ["Invalid time format. Please use HH:MM AM/PM format (e.g., '7:00 PM')."]
+async def get_time_filtered_flights(state: str, target_time_str: str, origin: str, destination: str,
+                                    departure_date: str,
+                                    trip_type: str = "one-way", seat: str = "economy",
+                                    adults: int = 1, children: int = 0,
+                                    infants_in_seat: int = 0, infants_on_lap: int = 0,
+                                    return_date: Optional[str] = None) -> list[str]:
+    """Filter outbound flights by departure time. For round-trip bundle pricing, pass return_date."""
+    return _time_filtered(state, target_time_str, origin, destination, departure_date,
+                          trip_type, seat, adults, children, infants_in_seat, infants_on_lap, return_date)
 
 
-        # Make API call to Google Flights via fast-flights
-        flight_data_input = [FlightData(date=departure_date, from_airport=origin, to_airport=destination)]
+# ---------- CLI ----------
 
-        passengers_input = Passengers(adults=adults, children=children, infants_in_seat=infants_in_seat, infants_on_lap=infants_on_lap)
-
-        result: Result = get_flights(
-            flight_data=flight_data_input,
-            trip=trip_type,
-            seat=seat,
-            passengers=passengers_input,
-            fetch_mode="fallback"
-        )
-        
-        result = asdict(result)
-        
-        if not result or "flights" not in result:
-            return ["No flight data available for the specified route and dates."]
+def _add_common(p):
+    p.add_argument("origin")
+    p.add_argument("destination")
+    p.add_argument("departure_date", help="YYYY-MM-DD")
+    p.add_argument("--trip-type", default="one-way", choices=["one-way", "round-trip"])
+    p.add_argument("--return-date", default=None, help="YYYY-MM-DD (required for round-trip)")
+    p.add_argument("--seat", default="economy", choices=["economy", "premium-economy", "business", "first"])
+    p.add_argument("--adults", type=int, default=1)
+    p.add_argument("--children", type=int, default=0)
+    p.add_argument("--infants-in-seat", type=int, default=0)
+    p.add_argument("--infants-on-lap", type=int, default=0)
 
 
-        all_flights = result["flights"]
+def main():
+    parser = argparse.ArgumentParser(description="Flight search CLI / MCP server")
+    sub = parser.add_subparsers(dest="cmd")
 
-        if not all_flights:
-            return ["No flights found for the specified route and dates."]
+    p_mcp = sub.add_parser("mcp", help="Run as MCP server over stdio")
 
+    p_g = sub.add_parser("general", help="General flight info")
+    _add_common(p_g)
+    p_g.add_argument("--n-flights", type=int, default=40)
 
-        valid_flights = []
-        
-        for flight in all_flights:
+    p_c = sub.add_parser("cheapest", help="Cheapest flights")
+    _add_common(p_c)
 
-            parts = flight['departure'].split(" ")
-            time_str = parts[0] + " " + parts[1]
+    p_b = sub.add_parser("best", help="Best flights")
+    _add_common(p_b)
 
-            flight_time = datetime.strptime(time_str, '%I:%M %p').time()
+    p_t = sub.add_parser("time-filtered", help="Filter by outbound time")
+    p_t.add_argument("state", choices=["before", "after"])
+    p_t.add_argument("target_time_str", help="e.g. '7:00 PM'")
+    _add_common(p_t)
 
-            if (state == "before"):
-                if (flight_time < target_time):
-                    valid_flights.append(flight)
-            elif (state == "after"):
-                if (flight_time >= target_time):
-                    valid_flights.append(flight)
+    args = parser.parse_args()
 
-        if not valid_flights:
-            return [f"No flights found {state} {target_time_str} for the specified route and dates."]
+    if args.cmd is None or args.cmd == "mcp":
+        mcp.run(transport='stdio')
+        return
 
+    common = dict(
+        origin=args.origin, destination=args.destination, departure_date=args.departure_date,
+        trip_type=args.trip_type, seat=args.seat,
+        adults=args.adults, children=args.children,
+        infants_in_seat=args.infants_in_seat, infants_on_lap=args.infants_on_lap,
+        return_date=args.return_date,
+    )
 
-        top_n_flights = valid_flights[0: min(30, len(valid_flights))]
+    if args.cmd == "general":
+        out = _general(**common, n_flights=args.n_flights)
+    elif args.cmd == "cheapest":
+        out = _cheapest(**common)
+    elif args.cmd == "best":
+        out = _best(**common)
+    elif args.cmd == "time-filtered":
+        out = _time_filtered(args.state, args.target_time_str, **common)
+    else:
+        parser.print_help()
+        sys.exit(2)
 
-        flight_info = []
-
-        origin_airport = origin
-        destination_airport = destination
-
-        for flight in top_n_flights:
-            flight_info.append(format_flight_info(flight, origin_airport, destination_airport))
-
-        context_str = f"Here are the time-filtered flights {('before' if state == 'before' else 'on or after')} {target_time_str}: "
-
-        output = [context_str] + flight_info
-
-
-        return output
-
-
-    except httpx.RequestError:
-        return ["Unable to connect to the flight search service. Please try again later."]
-    
-    except ValueError as e:
-        return [f"Invalid data received: {str(e)}"]
-    
-    except Exception as e:
-        return [f"An unexpected error occurred while searching for flights: {str(e)}"]
-    
-
-
-
-
+    for line in out:
+        print(line)
 
 
 if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
-
+    main()
